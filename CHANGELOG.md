@@ -15,6 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   while the page was being built.
 - Clicking the tray icon while the flyout is open now closes it. Before, the click closed the
   flyout and then immediately opened it again.
+- The tray menu shows Ctrl+Alt+1 to Ctrl+Alt+9 beside its switch items only while global shortcuts
+  are on, and only for the ones that registered. Before, it showed them even with the setting off,
+  when the keys did nothing.
 
 ### Removed
 
