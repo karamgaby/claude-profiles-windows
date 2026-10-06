@@ -15,6 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   while the page was being built.
 - Clicking the tray icon while the flyout is open now closes it. Before, the click closed the
   flyout and then immediately opened it again.
+- The message at the bottom of the Accounts page, such as "Registered … as Personal.", now clears
+  when you switch to another page or close the window. Before, it stayed until the app quit, and
+  could contradict the account list after a rename.
 
 ### Removed
 
