@@ -8,7 +8,9 @@ commit that added this file).
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +23,8 @@ from claude_profiles.services.cswap_client import (
 from claude_profiles.services.settings_service import Settings
 
 HOME = "/home/dev"
+BUNDLED = f"{HOME}/.local/share/claude-profiles/cswap-0.26.0/cswap/cswap"
+TARBALL = Path(r"C:\Apps\Claude Profiles\cswap-linux-0.26.0.tar.gz")
 
 
 @dataclass
@@ -42,6 +46,8 @@ class FakeWsl:
         which: str = f"{HOME}/.local/bin/cswap\n{HOME}/.local/bin/claude\n",
         version: str = "cswap 0.29.0\n",
         utf16: bool = False,
+        vscode: str = "",
+        unpacked: str | None = None,
     ) -> None:
         self.distros = distros
         self.running = running
@@ -49,6 +55,8 @@ class FakeWsl:
         self.which = which
         self.version = version
         self.utf16 = utf16
+        self.vscode = vscode  # what find lists under ~/.vscode-server
+        self.unpacked = unpacked  # what an unpacked bundled cswap reports, if there is one
         self.calls: list[list[str]] = []
 
     def _out(self, text: str, *, wsl_message: bool = False) -> bytes:
@@ -74,6 +82,19 @@ class FakeWsl:
             return Done(returncode=0 if "claude" in self.which else 1, stdout=self._out(self.which))
         if command[0] == "/usr/bin/env" and command[-1] == "--version":
             return Done(stdout=self._out(self.version))
+        if command[0] == "/usr/bin/env" and command[2] == "find":
+            return Done(stdout=self._out(self.vscode))
+        if command == [BUNDLED, "--version"]:
+            if self.unpacked is None:
+                return Done(returncode=127, stderr=self._out("No such file or directory"))
+            return Done(stdout=self._out(self.unpacked))
+        if command[0] == "wslpath":
+            return Done(stdout=self._out("/mnt/c/Apps/Claude Profiles/cswap-linux-0.26.0.tar.gz\n"))
+        if command[0] == "mkdir":
+            return Done()
+        if command[0] == "tar":
+            self.unpacked = "cswap 0.26.0\n"
+            return Done()
         raise AssertionError(f"unexpected wsl call: {argv}")
 
 
@@ -280,3 +301,85 @@ def test_the_environment_setting_is_normalized(stored, expected):
 def test_labels():
     assert wsl.environment_label("windows") == "Windows"
     assert wsl.environment_label("wsl:Ubuntu") == "Ubuntu (WSL)"
+
+
+@pytest.mark.parametrize(
+    ("primary", "stored", "expected"),
+    [
+        ("windows", "wsl:Ubuntu", "wsl:Ubuntu"),
+        ("wsl:Ubuntu", "windows", "windows"),
+        ("windows", "windows", ""),  # never the place Claude Code already runs in
+        ("wsl:Ubuntu", "wsl:Ubuntu", ""),
+        ("windows", "wsl:bad name", ""),
+        ("windows", 42, ""),
+    ],
+)
+def test_the_mirror_setting_is_normalized(primary, stored, expected):
+    settings = Settings(claude_environment=primary, mirror_environment=stored)
+    assert settings.normalized().mirror_environment == expected
+
+
+# --- nothing to install in the distro ----------------------------------------------
+
+
+@pytest.fixture
+def bundled(monkeypatch):
+    monkeypatch.setattr(wsl, "bundled_linux_cswap", lambda: (TARBALL, (0, 26, 0)))
+
+
+def _commands(fake: FakeWsl) -> list[str]:
+    return [call[call.index("--exec") + 1] for call in fake.calls if "--exec" in call]
+
+
+def test_the_shipped_cswap_is_unpacked_into_a_distro_without_one(bundled):
+    fake = FakeWsl(which=f"{HOME}/.local/bin/claude")
+
+    env = wsl.detect("Ubuntu", fake)
+
+    assert env.cswap == BUNDLED and env.version == (0, 26, 0)
+    wslpath = next(c for c in fake.calls if "wslpath" in c)
+    assert wslpath[-1] == str(TARBALL)  # one argv entry, spaces and all
+    tar = next(c for c in fake.calls if "tar" in c)
+    assert tar[-4:] == [
+        "-xzf",
+        "/mnt/c/Apps/Claude Profiles/cswap-linux-0.26.0.tar.gz",
+        "-C",
+        f"{HOME}/.local/share/claude-profiles/cswap-0.26.0",
+    ]
+
+
+def test_an_unpacked_copy_is_reused(bundled):
+    fake = FakeWsl(unpacked="cswap 0.26.0")
+    assert wsl.detect("Ubuntu", fake).cswap == BUNDLED
+    assert "tar" not in _commands(fake) and "wslpath" not in _commands(fake)
+
+
+def test_a_copy_from_another_version_is_replaced(bundled):
+    fake = FakeWsl(unpacked="cswap 0.25.0")
+    wsl.detect("Ubuntu", fake)
+    assert "tar" in _commands(fake)
+
+
+def test_vscodes_own_claude_signs_in_when_none_is_installed():
+    ext = f"{HOME}/.vscode-server/extensions"
+    old = f"{ext}/anthropic.claude-code-2.1.99-linux-x64/resources/native-binary/claude"
+    new = f"{ext}/anthropic.claude-code-2.1.319-linux-x64/resources/native-binary/claude"
+    fake = FakeWsl(which=f"{HOME}/.local/bin/cswap", vscode=f"{old}\n{new}\n")
+
+    env = wsl.detect("Ubuntu", fake)
+
+    assert env.claude == new  # the newest, compared as versions rather than text
+    assert env.sign_in_command()[-3:] == [new, "auth", "login"]
+    # cswap run looks claude up on PATH, so its folder is added.
+    assert env.exec_prefix()[-1].endswith(":" + new.rsplit("/", 1)[0])
+
+
+def test_the_shipped_tarball_is_found_beside_the_installed_app(tmp_path, monkeypatch):
+    exe = tmp_path / "ClaudeProfiles.exe"
+    exe.write_bytes(b"")
+    (tmp_path / "cswap-linux-0.26.0.tar.gz").write_bytes(b"")
+    monkeypatch.setattr(sys, "executable", str(exe))
+
+    assert wsl.bundled_linux_cswap() is None  # a source checkout ships none
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert wsl.bundled_linux_cswap() == (tmp_path / "cswap-linux-0.26.0.tar.gz", (0, 26, 0))

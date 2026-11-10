@@ -17,8 +17,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  cswap-linux:
+    name: Freeze claude-swap for WSL
+    # The script builds with a uv-managed Python, so the runner's glibc does not
+    # limit which distributions the result runs on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        run: pipx install uv==0.13.6
+
+      - name: Freeze (pinned, hash-checked)
+        run: bash tools/cswap/build_linux.sh dist/linux
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cswap-linux
+          path: dist/linux/
+          if-no-files-found: error
+
   build:
     name: Build and verify
+    needs: cswap-linux
     runs-on: windows-latest
     permissions:
       contents: read
@@ -63,8 +84,15 @@ jobs:
             choco install innosetup --yes --no-progress
           }
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: cswap-linux
+          path: dist-linux
+
       - name: Build installer and portable zip
-        run: ./tools/build_release.ps1 -Python python
+        run: |
+          $linux = (Get-ChildItem dist-linux\cswap-linux-*.tar.gz).FullName
+          ./tools/build_release.ps1 -Python python -LinuxCswap $linux
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -114,7 +142,7 @@ jobs:
           | ClaudeProfiles-${version}-win-x64-portable.zip | The same app, unzipped anywhere and run from \`ClaudeProfiles.exe\`. |
           | SHA256SUMS.txt | Checksums for both. |
 
-          Claude Profiles needs [claude-swap](https://github.com/realiti4/claude-swap) installed separately: \`uv tool install claude-swap\`.
+          [claude-swap](https://github.com/realiti4/claude-swap) is included, for Windows and for Claude Code in WSL: nothing else to install.
 
           > The binaries are not code-signed, so Windows SmartScreen may say it "protected your PC". Choose **More info** and then **Run anyway**. Every file here was built by GitHub Actions from the tagged source, and you can prove it:
           >

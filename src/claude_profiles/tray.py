@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import threading
+import time
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
@@ -44,6 +45,10 @@ from .widgets.compact_popup import CompactPopup
 from .widgets.setup_dialog import SetupDialog
 from .widgets.status_badge import format_age
 
+# How long "Add to <WSL>" waits for the sign-in it opened there.
+MIRROR_SIGN_IN_WAIT = 600
+MIRROR_POLL_SECONDS = 3.0
+
 SWITCH_HINT = (
     "Your next Claude Code message should use {name}. If the VS Code Claude "
     "panel still shows the former account, close and reopen that Claude panel."
@@ -61,6 +66,8 @@ class TrayController(QObject):
     signInFixed = Signal(str, bool, str)  # profile key, ok, user-safe message
     distrosReady = Signal(object)  # list[str]: installed WSL distributions
     environmentStatus = Signal(str, str)  # text, tone
+    mirrorChecked = Signal(object, str)  # set of emails there | None, problem
+    mirrorProgress = Signal(str, bool)  # message, ok
 
     def __init__(
         self,
@@ -91,7 +98,10 @@ class TrayController(QObject):
         self._setup_dialog: SetupDialog | None = None
         self._last_error: str | None = None
 
+        self._mirror_backend: CswapBackend | None = None
+        self._mirror_adding = False
         self.profiles = ProfileService(backend, settings_service, parent=self)
+        self._apply_mirror()
         self.launcher = ProcessLauncher()
 
         self.tray = QSystemTrayIcon(tray_icon(), self)
@@ -215,6 +225,7 @@ class TrayController(QObject):
         self.profiles.activityAdded.connect(self._on_activity)
         self.profiles.switchSucceeded.connect(self._on_switch_succeeded)
         self.profiles.switchFailed.connect(self._on_switch_failed)
+        self.profiles.mirrorFailed.connect(self._on_mirror_failed)
         self.profiles.setupSucceeded.connect(self._on_setup_succeeded)
         self.profiles.setupFailed.connect(self._on_setup_failed)
         self.profiles.schemaWarning.connect(self._on_schema_warning)
@@ -222,6 +233,8 @@ class TrayController(QObject):
         self.registerDone.connect(self._on_register_done)
         self.signInFixed.connect(self._on_sign_in_fixed)
         self.distrosReady.connect(self._on_distros_ready)
+        self.mirrorChecked.connect(self._on_mirror_checked)
+        self.mirrorProgress.connect(self._on_mirror_progress)
         self.environmentStatus.connect(self._on_environment_status)
 
         self.polling.pollSucceeded.connect(self._on_poll_succeeded)
@@ -516,13 +529,17 @@ class TrayController(QObject):
         self._setup_dialog = None
         self._refresh()
 
-    def _sign_in_command(self) -> tuple[list[str] | None, str]:
+    def _sign_in_command(
+        self, backend: CswapBackend | None = None
+    ) -> tuple[list[str] | None, str]:
         """``claude auth login`` where Claude Code runs, or why there is none.
 
         For WSL this is the distro's own Claude Code, so the login lands in the
-        distro's ``~/.claude`` - the one claude-swap there manages.
+        distro's ``~/.claude`` - the one claude-swap there manages. ``backend``
+        defaults to the managed one; the mirror passes its own.
         """
-        hook = getattr(self._backend, "sign_in_command", None)
+        backend = backend or self._backend
+        hook = getattr(backend, "sign_in_command", None)
         if hook is None:
             claude = find_claude()
             if claude is None:
@@ -536,7 +553,7 @@ class TrayController(QObject):
         except CswapError as exc:
             return None, exc.user_message
         if command is None:
-            return None, self._backend.sign_in_unavailable()
+            return None, backend.sign_in_unavailable()
         return command, ""
 
     def _start_sign_in(self, dialog: SetupDialog) -> None:
@@ -588,6 +605,7 @@ class TrayController(QObject):
             self.profiles.last_accounts, self.profiles.states
         )
         self.profiles.run_in_background(self._read_login)
+        self._refresh_mirror()
 
     def _read_login(self) -> None:
         self.loginReady.emit(self.profiles.read_current_login())
@@ -703,12 +721,15 @@ class TrayController(QObject):
             window.setup_page.registerRequested.connect(self._register_profile)
             window.setup_page.assignAliasRequested.connect(self._assign_alias)
             window.setup_page.refreshRequested.connect(self._refresh_setup)
+            window.setup_page.mirrorEnableRequested.connect(self._enable_mirror)
+            window.setup_page.mirrorAddRequested.connect(self._add_to_mirror)
             window.visibilityChanged.connect(self._on_ui_visibility_changed)
             window.accountsTabShown.connect(self._refresh_setup)
             self._window = window
             if self._environment_resolver is not None:
                 window.set_environments(self._distros)
                 self._refresh_environment_status()
+                self._refresh_mirror()
         return self._window
 
     @Slot()
@@ -729,6 +750,8 @@ class TrayController(QObject):
 
         if self._settings.claude_environment != previous.claude_environment:
             self._apply_environment(self._settings.claude_environment)
+        if self._settings.mirror_environment != previous.mirror_environment:
+            self._apply_mirror()
 
         self.notifications.configure(
             enabled=self._settings.notifications_enabled,
@@ -774,6 +797,7 @@ class TrayController(QObject):
         self._distros = list(distros)
         if self._window is not None:
             self._window.set_environments(self._distros)
+            self._refresh_mirror()
 
     def _apply_environment(self, value: str) -> None:
         """Point every service at Claude Code in ``value`` and start over."""
@@ -790,6 +814,160 @@ class TrayController(QObject):
         self._set_status(f"Reading accounts in {self._backend.label}…")
         self._refresh_environment_status()
         self.polling.poll_now()
+
+    def _apply_mirror(self) -> None:
+        """Repeat every switch in the second environment, if one is chosen."""
+        value = self._settings.mirror_environment
+        if self._environment_resolver is None or not value:
+            self._mirror_backend = None
+        else:
+            self._mirror_backend = self._environment_resolver(value)
+        self.profiles.set_mirror(
+            self._mirror_backend, wsl.environment_label(value) if value else ""
+        )
+        self._refresh_mirror()
+
+    # -- keeping that second Claude Code on the same account ---------------------
+
+    def _mirror_offers(self) -> list[tuple[str, str]]:
+        """(value, label) places switches could also be repeated in. Empty
+        without a WSL distribution, so a Windows-only machine is offered none."""
+        if self._environment_resolver is None or not self._distros:
+            return []
+        values = [wsl.WINDOWS] + [wsl.environment_value(d) for d in self._distros]
+        primary = self._settings.claude_environment
+        return [(v, wsl.environment_label(v)) for v in values if v != primary]
+
+    def _refresh_mirror(self) -> None:
+        """Re-check which accounts the mirror has. This may start the distro,
+        so it only runs for a window the user is looking at."""
+        if self._window is None:
+            return
+        self._on_mirror_checked(None, "")
+        if self.profiles.mirror_label:
+            threading.Thread(
+                target=self._check_mirror, name="mirror-check", daemon=True
+            ).start()
+
+    def _check_mirror(self) -> None:
+        try:
+            self.mirrorChecked.emit(self.profiles.mirror_emails_sync(), "")
+        except CswapError as exc:
+            self.mirrorChecked.emit(None, exc.user_message)
+
+    @Slot(object, str)
+    def _on_mirror_checked(self, emails: set[str] | None, problem: str) -> None:
+        if self._window is None:
+            return
+        label = self.profiles.mirror_label
+        rows = None
+        if emails is not None:
+            rows = [
+                (
+                    s.profile.key,
+                    s.profile.name,
+                    s.account.email,
+                    s.account.email.casefold() in emails,
+                )
+                for s in self.profiles.states
+                if s.account is not None
+            ]
+        offers = [] if label else self._mirror_offers()
+        self._window.setup_page.update_mirror(label, rows, offers, problem)
+        missing = [name for _, name, _, ready in rows or [] if not ready]
+        if not label or rows == []:
+            status = ("", "tertiary")
+        elif problem:
+            status = (problem, "critical")
+        elif rows is None:
+            status = (f"Checking {label}…", "tertiary")
+        elif missing:
+            status = (
+                f"Not added there yet: {', '.join(missing)}. Add them on the "
+                "Accounts page.",
+                "caution",
+            )
+        else:
+            status = ("Every account is ready there.", "success")
+        self._window.set_mirror_status(*status)
+
+    @Slot(str)
+    def _enable_mirror(self, value: str) -> None:
+        self._settings = self._settings_service.update(mirror_environment=value)
+        self._apply_mirror()
+        if self._window is not None:
+            self._window.load_settings(self._settings)
+        if self.profiles.mirror_label:
+            self.profiles.log(f"Switches are now repeated in {self.profiles.mirror_label}")
+
+    @Slot(str)
+    def _add_to_mirror(self, key: str) -> None:
+        if self._mirror_adding:
+            return
+        self._mirror_adding = True
+        threading.Thread(
+            target=self._add_to_mirror_worker, args=(key,), name="mirror-add", daemon=True
+        ).start()
+
+    def _add_to_mirror_worker(self, key: str) -> None:
+        try:
+            outcome, message = self.profiles.add_to_mirror_sync(key)
+            if outcome == "sign-in":
+                outcome, message = self._sign_in_to_mirror(key)
+            self.mirrorProgress.emit(message, outcome == "added")
+        finally:
+            self._mirror_adding = False
+            self._check_mirror()
+
+    def _sign_in_to_mirror(self, key: str) -> tuple[str, str]:
+        """Open the sign-in there, wait for that account, then store it."""
+        mirror, where = self._mirror_backend, self.profiles.mirror_label
+        state = self.profiles.state(key)
+        if mirror is None or state is None or state.account is None:
+            return "error", "That account is not available any more."
+        email = state.account.email
+        command, problem = self._sign_in_command(mirror)
+        if command is None:
+            return "error", problem
+        before = self._mirror_login(mirror)
+        result = self.launcher.launch(
+            command, f"Sign in to Claude Code in {where}", keep_open=False
+        )
+        if not result.ok:
+            return "error", result.message
+        self.mirrorProgress.emit(
+            f"A terminal opened to sign in to Claude Code in {where}. Sign in as "
+            f"{email} in the browser; this finishes by itself.",
+            True,
+        )
+        deadline = time.monotonic() + MIRROR_SIGN_IN_WAIT
+        while time.monotonic() < deadline:
+            time.sleep(MIRROR_POLL_SECONDS)
+            login = self._mirror_login(mirror)
+            if login == email.casefold():
+                return self.profiles.add_to_mirror_sync(key)
+            if login and login != before:
+                return "error", (
+                    f"{where} was signed in as {login}, not {email}. Press Add to "
+                    f"{where} again and choose {email}."
+                )
+        return "error", (
+            f"{where} was not signed in as {email} within "
+            f"{MIRROR_SIGN_IN_WAIT // 60} minutes. Press Add to {where} to try again."
+        )
+
+    @staticmethod
+    def _mirror_login(mirror: CswapBackend) -> str:
+        try:
+            return (mirror.status().email or "").casefold()
+        except CswapError:
+            return ""
+
+    @Slot(str, bool)
+    def _on_mirror_progress(self, message: str, ok: bool) -> None:
+        if self._window is not None:
+            self._window.setup_page.set_result(message, ok=ok)
+        self._set_status(message)
 
     def _refresh_environment_status(self) -> None:
         """Describe the WSL target on the Settings card (detection may boot it)."""
@@ -913,6 +1091,11 @@ class TrayController(QObject):
         state = self.profiles.state(key)
         name = state.profile.name if state else key
         self._notify_plain(f"Could not switch to {name}", message)
+        self._set_status(message)
+
+    @Slot(str)
+    def _on_mirror_failed(self, message: str) -> None:
+        self._notify_plain("Claude Profiles", message)
         self._set_status(message)
 
     @Slot(str, str)

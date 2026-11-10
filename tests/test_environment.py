@@ -125,7 +125,9 @@ def test_a_poll_from_before_a_switch_is_dropped(qtbot):
 def env_controller(qapp, tmp_path):
     made: list[TrayController] = []
 
-    def _make(*, wsl_target: SleepyMock | None = None) -> TrayController:
+    def _make(
+        *, wsl_target: SleepyMock | None = None, distros: tuple[str, ...] = ("Ubuntu",)
+    ) -> TrayController:
         target = wsl_target or SleepyMock("two_accounts")
         backend = SwitchableBackend(MockCswapClient("healthy"))
         ctl = TrayController(
@@ -136,7 +138,7 @@ def env_controller(qapp, tmp_path):
             environment_resolver=lambda value: (
                 target if value.startswith("wsl:") else MockCswapClient("healthy")
             ),
-            distro_lister=lambda: ["Ubuntu"],
+            distro_lister=lambda: list(distros),
         )
         made.append(ctl)
         return ctl
@@ -263,3 +265,144 @@ def test_a_persistent_failure_is_logged_once(tmp_path):
 
     failures = [e for e in svc.recent_activity() if "Usage refresh failed" in e.message]
     assert len(failures) == 2  # once, then again after a success in between
+
+
+def test_the_mirror_follows_a_windows_switch(env_controller, qtbot):
+    target = SleepyMock("two_accounts")
+    ctl = env_controller(wsl_target=target)
+    ctl.profiles.refresh_sync()
+    ctl._on_settings_changed(
+        dataclasses.replace(ctl._settings, mirror_environment="wsl:Ubuntu")
+    )
+
+    ctl.profiles.switch_sync("work")
+
+    assert any(c.startswith("switch:") for c in target.calls)
+
+
+def test_the_mirror_list_leaves_out_where_claude_code_runs(env_controller, qtbot):
+    ctl = env_controller()
+    ctl._list_distros()
+    window = ctl._ensure_window()
+    mirror = window._mirror_combo
+
+    qtbot.waitUntil(lambda: mirror.count() == 2, timeout=5000)
+    assert [mirror.itemText(i) for i in range(mirror.count())] == ["Nowhere", "Ubuntu (WSL)"]
+
+    emitted: list[Settings] = []
+    window.settingsChanged.connect(emitted.append)
+    mirror.setCurrentIndex(1)
+    assert emitted[-1].mirror_environment == "wsl:Ubuntu"
+
+    # Moving Claude Code into Ubuntu offers Windows instead and drops the mirror.
+    window._environment_combo.setCurrentIndex(1)
+    assert [mirror.itemText(i) for i in range(mirror.count())] == ["Nowhere", "Windows"]
+    assert emitted[-1].mirror_environment == ""
+
+
+# --- WSL only where there is WSL, and setting it up from the app -------------------
+
+
+def _visible_text(window) -> str:
+    """Every label, button, box title and list entry the user can see."""
+    from PySide6.QtWidgets import QAbstractButton, QComboBox, QGroupBox, QLabel
+
+    parts: list[str] = []
+    for widget in window.findChildren(QLabel):
+        if widget.isVisibleTo(window):
+            parts.append(widget.text())
+    for widget in window.findChildren(QAbstractButton):
+        if widget.isVisibleTo(window):
+            parts.append(widget.text())
+    for widget in window.findChildren(QGroupBox):
+        if widget.isVisibleTo(window):
+            parts.append(widget.title())
+    for widget in window.findChildren(QComboBox):
+        if widget.isVisibleTo(window):
+            parts += [widget.itemText(i) for i in range(widget.count())]
+    return "\n".join(parts)
+
+
+def test_a_machine_without_wsl_never_mentions_it(env_controller):
+    from claude_profiles.main_window import TAB_ACCOUNTS, TAB_PRIVACY, TAB_SETTINGS
+
+    ctl = env_controller(distros=())
+    ctl.profiles.refresh_sync()
+    ctl._list_distros()
+    window = ctl._ensure_window()
+
+    for tab in (TAB_ACCOUNTS, TAB_PRIVACY, TAB_SETTINGS):
+        window.show_tab(tab)
+        assert "WSL" not in _visible_text(window)
+
+
+def test_with_wsl_the_accounts_page_offers_it_and_lists_what_is_missing(env_controller, qtbot):
+    from PySide6.QtWidgets import QPushButton
+
+    from claude_profiles.main_window import TAB_ACCOUNTS, TAB_SETTINGS
+
+    ctl = env_controller()  # healthy has 3 accounts, the WSL side 2 of them
+    ctl.profiles.refresh_sync()
+    ctl._list_distros()
+    window = ctl._ensure_window()
+    window.show_tab(TAB_SETTINGS)
+    assert window._environment_card.isVisibleTo(window)
+    window.show_tab(TAB_ACCOUNTS)
+    page = window.setup_page
+
+    offer = next(b for b in page.findChildren(QPushButton) if b.text() == "Switch Ubuntu (WSL) too")
+    offer.click()
+
+    assert ctl._settings_service.load().mirror_environment == "wsl:Ubuntu"
+    assert page._mirror_box.title() == "Also switched in Ubuntu (WSL)"
+    qtbot.waitUntil(lambda: "Side Project" in window._mirror_card.status(), timeout=5000)
+    add = [b.text() for b in page.findChildren(QPushButton) if b.isVisibleTo(window)]
+    assert "Add to Ubuntu (WSL)" in add
+
+
+def _sign_in_scenario(env_controller, monkeypatch, signs_in_as):
+    """WSL is signed in as personal; the user is sent to sign in as work."""
+    import claude_profiles.tray as tray_module
+    from claude_profiles.services.process_launcher import LaunchResult
+
+    monkeypatch.setattr(tray_module, "MIRROR_POLL_SECONDS", 0)
+    target = SleepyMock("no_accounts")
+    ctl = env_controller(wsl_target=target)
+    ctl.profiles.refresh_sync()
+    ctl._enable_mirror("wsl:Ubuntu")
+    target.set_signed_in(ctl.profiles.state("personal").account.email)
+    launched: list[list[str]] = []
+
+    class Launcher:
+        def launch(self, command, title, keep_open=False):
+            launched.append(command)
+            target.set_signed_in(signs_in_as(ctl))  # the user finishing in the browser
+            return LaunchResult(True, "opened")
+
+    ctl.launcher = Launcher()
+    results: list[tuple[str, bool]] = []
+    ctl.mirrorProgress.connect(lambda message, ok: results.append((message, ok)))
+    ctl._add_to_mirror_worker("work")
+    return ctl, launched, results
+
+
+def test_add_to_wsl_opens_its_sign_in_and_finishes_by_itself(env_controller, monkeypatch):
+    ctl, launched, results = _sign_in_scenario(
+        env_controller, monkeypatch, lambda ctl: ctl.profiles.state("work").account.email
+    )
+
+    assert launched == [SleepyMock().sign_in]
+    work = ctl.profiles.state("work").account.email
+    assert ctl.profiles.mirror_emails_sync() == {work.casefold()}
+    assert results[0][1] and "Sign in as" in results[0][0]
+    assert results[-1] == ("Work is ready in Ubuntu (WSL).", True)
+
+
+def test_signing_in_as_the_wrong_account_says_so(env_controller, monkeypatch):
+    ctl, _, results = _sign_in_scenario(
+        env_controller, monkeypatch, lambda ctl: "someone@example.invalid"
+    )
+
+    assert ctl.profiles.mirror_emails_sync() == set()
+    message, ok = results[-1]
+    assert not ok and "someone@example.invalid, not" in message

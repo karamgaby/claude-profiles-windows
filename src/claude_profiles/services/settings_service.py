@@ -54,6 +54,9 @@ class Settings:
     # Where Claude Code runs: "windows", or "wsl:<distro>" to manage the
     # Claude Code inside that WSL distribution instead.
     claude_environment: str = WINDOWS
+    # A second place whose Claude Code follows every switch, matched by email:
+    # "" for none, "windows" or "wsl:<distro>". Never the same as the above.
+    mirror_environment: str = ""
     # A short hash of the executable the Windows shortcuts were written for,
     # so startup can notice that a better launcher is now available. Hashed
     # rather than stored: the path contains the Windows username, and this file
@@ -74,12 +77,19 @@ class Settings:
             environment = WINDOWS
         else:
             environment = environment_value(distro_of(environment))
+        mirror = self.mirror_environment
+        if mirror != WINDOWS:
+            distro = distro_of(mirror) if isinstance(mirror, str) else None
+            mirror = environment_value(distro) if distro else ""
+        if mirror == environment:
+            mirror = ""
         return replace(
             self,
             refresh_interval_seconds=interval,
             warn_threshold_pct=warn,
             critical_threshold_pct=critical,
             claude_environment=environment,
+            mirror_environment=mirror,
         )
 
 

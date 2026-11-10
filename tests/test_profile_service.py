@@ -606,3 +606,59 @@ def test_the_demo_looks_like_a_real_account(settings_service):
         # Real claude-swap sets the 7-day pace from time elapsed, not from usage.
         assert usage.seven_day.expected_pct == SEVEN_DAY_EXPECTED
         assert usage.seven_day.ahead_of_pace == (usage.seven_day.pct > SEVEN_DAY_EXPECTED)
+
+
+# --- mirroring switches into a second environment ------------------------------
+
+
+def test_a_switch_is_repeated_in_the_mirror_by_email(service):
+    svc, _ = service
+    mirror = MockCswapClient("healthy")
+    svc.set_mirror(mirror, "Ubuntu (WSL)")
+    svc.refresh_sync()
+
+    ok, message = svc.switch_sync("work")
+
+    assert ok is True
+    assert "switch:work" in mirror.calls
+    assert "Ubuntu (WSL) too" in message
+
+
+def test_an_already_active_account_still_brings_the_mirror_along(service):
+    svc, _ = service
+    mirror = MockCswapClient("healthy")
+    mirror.switch("work")
+    svc.set_mirror(mirror, "Ubuntu (WSL)")
+    svc.refresh_sync()
+
+    ok, _ = svc.switch_sync("personal")
+
+    assert ok is True
+    assert mirror.calls[-1] == "switch:personal"
+
+
+def test_a_mirror_without_the_account_reports_but_keeps_the_switch(service, qtbot):
+    svc, _ = service
+    svc.set_mirror(MockCswapClient("no_accounts"), "Ubuntu (WSL)")
+    svc.refresh_sync()
+
+    with qtbot.waitSignal(svc.mirrorFailed) as blocker:
+        ok, message = svc.switch_sync("work")
+
+    assert ok is True
+    assert svc.state("work").is_active is True
+    assert "not added there" in blocker.args[0]
+    assert "Ubuntu (WSL) was not switched" in message
+
+
+def test_adding_to_the_mirror_needs_it_signed_in_as_that_account(service):
+    svc, _ = service
+    mirror = MockCswapClient("no_accounts")
+    mirror.set_signed_in(fx.WORK_EMAIL)
+    svc.set_mirror(mirror, "Ubuntu (WSL)")
+    svc.refresh_sync()
+
+    assert svc.add_to_mirror_sync("personal") == ("sign-in", "")
+    assert svc.add_to_mirror_sync("work") == ("added", "Work is ready in Ubuntu (WSL).")
+    assert svc.mirror_emails_sync() == {fx.WORK_EMAIL}
+    assert "add:work" in mirror.calls

@@ -76,6 +76,8 @@ Name: "cswappath"; Description: "Add the bundled claude-swap (cswap) to my PATH,
 ; stops an upgrade leaving stale DLLs beside the new ones.
 Type: filesandordirs; Name: "{app}\_internal"
 Type: filesandordirs; Name: "{app}\cswap\_internal"
+; The WSL copy is named by version, so an upgrade would otherwise keep the old one.
+Type: files; Name: "{app}\cswap-linux-*.tar.gz"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

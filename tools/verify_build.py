@@ -86,6 +86,8 @@ def check_bundled_cswap(exe: Path) -> None:
     cswap = exe.parent / "cswap" / "cswap.exe"
     if not cswap.is_file():
         raise Failure(f"bundled claude-swap missing: {cswap}")
+    if not any(exe.parent.glob("cswap-linux-*.tar.gz")):
+        raise Failure("bundled claude-swap for WSL missing: cswap-linux-*.tar.gz")
     result = subprocess.run(
         [str(cswap), "--version"], capture_output=True, text=True, timeout=60, check=False
     )

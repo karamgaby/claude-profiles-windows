@@ -13,9 +13,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Claude Code in WSL2. If you run Claude Code inside a WSL distribution, including VS Code in
   Remote-WSL, choose that distribution under **Settings > Claude Code runs in**. Claude Profiles
   then lists, switches, launches and signs in to the accounts of the Claude Code in that
-  distribution, through claude-swap installed there. Background checks never start a stopped
-  distribution, so WSL can still shut down when idle; opening Claude Profiles starts it.
+  distribution. The installer includes a Linux build of claude-swap and unpacks it there, and
+  signing in can use the Claude Code that VS Code ships, so nothing needs installing in WSL.
+  Background checks never start a stopped distribution, so WSL can still shut down when idle;
+  opening Claude Profiles starts it.
   ([#9](https://github.com/kevinabouhanna/claude-profiles-windows/issues/9))
+- Keep WSL on the same account as Windows. On a machine with a WSL distribution, the Accounts page
+  offers **Switch Ubuntu (WSL) too**; every switch is then repeated there, matched by email, and
+  clicking the account already active brings WSL along. The page shows which accounts are ready
+  there and adds a missing one with one click: it opens the sign-in inside WSL and stores the
+  account once you have signed in. Also under **Settings > Also switch accounts in**. Machines
+  without WSL see none of this.
 
 ### Fixed
 

@@ -41,6 +41,8 @@ class ProfileService(QObject):
     activityAdded = Signal(object)  # ActivityEntry
     switchSucceeded = Signal(str)  # profile key
     switchFailed = Signal(str, str)  # profile key, user-safe message
+    # The switch worked, but the mirror environment did not follow.
+    mirrorFailed = Signal(str)  # user-safe message
     setupSucceeded = Signal(str, str)  # profile key, user-safe message
     setupFailed = Signal(str, str)  # profile key, user-safe message
     schemaWarning = Signal(int)  # unrecognised schemaVersion
@@ -72,6 +74,55 @@ class ProfileService(QObject):
         # Retained so the setup page can show accounts that carry no alias yet.
         self.last_accounts: AccountList | None = None
         self.last_status: ActiveStatus | None = None
+        # A second Claude Code (e.g. WSL while managing Windows) that every
+        # switch is repeated in. Its accounts are never shown, only matched.
+        self._mirror: CswapBackend | None = None
+        self._mirror_label = ""
+
+    def set_mirror(self, backend: CswapBackend | None, label: str = "") -> None:
+        self._mirror, self._mirror_label = backend, label
+
+    @property
+    def mirror_label(self) -> str:
+        """Where switches are repeated, e.g. "Ubuntu (WSL)", or "" for nowhere."""
+        return self._mirror_label if self._mirror is not None else ""
+
+    def mirror_emails_sync(self) -> set[str]:
+        """The (casefolded) emails the mirror has stored. Raises CswapError."""
+        if self._mirror is None:
+            return set()
+        return {a.email.casefold() for a in self._mirror.list_accounts().accounts}
+
+    def add_to_mirror_sync(self, key: str) -> tuple[str, str]:
+        """Store ``key``'s account in the mirror, if the mirror is signed in as it.
+
+        Returns ``(outcome, message)``: "added", "sign-in" when the user has to
+        sign in there as that account first, or "error".
+        """
+        state, mirror, where = self._states.get(key), self._mirror, self._mirror_label
+        if state is None or state.account is None or mirror is None:
+            return "error", "That account is not available any more."
+        if self._busy:
+            return "error", "Another action is still running."
+        self._set_busy(True)
+        try:
+            login = mirror.status()
+            if (login.email or "").casefold() != state.account.email.casefold():
+                return "sign-in", ""
+            if state.profile.alias:
+                mirror.add_current_account(state.profile.alias)
+            else:
+                mirror.resync_login()  # plain ``cswap add``: stores it unnamed
+            self.log(f"Added {state.profile.name} to {where}")
+            # Signing in there moved it off the account in use here; put it back.
+            active = self.active_state
+            if active is not None:
+                self._switch_mirror(active)
+            return "added", f"{state.profile.name} is ready in {where}."
+        except CswapError as exc:
+            return "error", exc.user_message
+        finally:
+            self._set_busy(False)
 
     # -- state --------------------------------------------------------------
 
@@ -292,7 +343,8 @@ class ProfileService(QObject):
             if state.is_active:
                 message = f"{state.profile.name} is already the active account."
                 self.switchSucceeded.emit(key)
-                return True, message
+                # The mirror may still be on another account: bring it along.
+                return True, message + self._switch_mirror(state)
 
             previous = self.active_state
             previous_name = previous.profile.name if previous else "another account"
@@ -318,18 +370,46 @@ class ProfileService(QObject):
                     f"Switched to {state.profile.name}, but refreshing usage failed."
                 )
                 self.switchSucceeded.emit(key)
-                return True, message
+                return True, message + self._switch_mirror(state)
 
             self.apply_accounts(accounts)
             # Confirmation only; the list result already stands.
             with contextlib.suppress(CswapError):
                 self._backend.status()
 
-            message = f"Switched from {previous_name} to {state.profile.name}"
+            message = f"Switched from {previous_name} to {state.profile.name}."
             self.switchSucceeded.emit(key)
-            return True, message
+            return True, message + self._switch_mirror(state)
         finally:
             self._set_busy(False)
+
+    def _switch_mirror(self, state: ProfileState) -> str:
+        """Put the mirror on the same login, found by email: slot numbers and
+        aliases differ between environments. Returns text for the message."""
+        mirror, where = self._mirror, self._mirror_label
+        if mirror is None or state.account is None:
+            return ""
+        email = state.account.email.casefold()
+        try:
+            match = next(
+                (a for a in mirror.list_accounts().accounts if a.email.casefold() == email),
+                None,
+            )
+            if match is not None:
+                if not match.active:
+                    mirror.switch(match.alias, fallback_number=match.number)
+                self.log(f"{where} now uses {state.profile.name}")
+                return f" {where} too."
+            problem = (
+                f"{state.profile.name} is not added there yet. Add it on the "
+                "Accounts page."
+            )
+        except CswapError as exc:
+            problem = exc.user_message
+        message = f"{where} was not switched: {problem}"
+        self.log(message, level="error")
+        self.mirrorFailed.emit(message)
+        return f" {message}"
 
     def repair_login_sync(self, key: str) -> tuple[bool, str]:
         """Fix sign-in: store the current Claude Code login for ``key`` now.

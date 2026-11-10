@@ -82,6 +82,8 @@ class SetupPage(QWidget):
     registerRequested = Signal(str)  # alias
     assignAliasRequested = Signal(int, str)  # account number, alias
     refreshRequested = Signal()
+    mirrorEnableRequested = Signal(str)  # environment value, e.g. "wsl:Ubuntu"
+    mirrorAddRequested = Signal(str)  # profile key
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -109,6 +111,7 @@ class SetupPage(QWidget):
         outer.addWidget(self._build_sign_in_step())
         outer.addWidget(self._build_register_step())
         outer.addWidget(self._build_existing_accounts())
+        outer.addWidget(self._build_mirror())
         outer.addStretch(1)
 
         self._result = QLabel("")
@@ -230,6 +233,88 @@ class SetupPage(QWidget):
         row.addWidget(self._alias_button)
         layout.addLayout(row)
         return box
+
+    def _build_mirror(self) -> QWidget:
+        """A second Claude Code (WSL) to keep on the same account. Hidden
+        unless there is one, so a Windows-only machine never hears of WSL."""
+        self._mirror_box = box = QGroupBox("")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(8)
+        self._mirror_detail = QLabel("")
+        self._mirror_detail.setWordWrap(True)
+        self._mirror_detail.setStyleSheet(muted_label_css(self, 12))
+        layout.addWidget(self._mirror_detail)
+        self._mirror_rows = QVBoxLayout()
+        self._mirror_rows.setSpacing(6)
+        layout.addLayout(self._mirror_rows)
+        box.setVisible(False)
+        return box
+
+    def update_mirror(
+        self,
+        label: str,
+        rows: list[tuple[str, str, str, bool]] | None,
+        offers: list[tuple[str, str]],
+        problem: str = "",
+    ) -> None:
+        """Show where switches are repeated and which accounts are ready there.
+
+        ``label`` is that place ("" when switches are not repeated anywhere);
+        ``rows`` are (key, name, email, ready), or None while being checked;
+        ``offers`` are (value, label) places that could be turned on.
+        """
+        while self._mirror_rows.count():
+            item = self._mirror_rows.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._mirror_box.setVisible(bool(label or offers))
+
+        if not label:
+            names = " or ".join(name for _, name in offers)
+            self._mirror_box.setTitle(f"Also use Claude Code in {names}?")
+            self._mirror_detail.setText(
+                "For example through VS Code. It keeps its own sign-in, so "
+                "switching here does not reach it. Turn this on and every switch "
+                "is repeated there."
+            )
+            for value, name in offers:
+                button = QPushButton(f"Switch {name} too")
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.clicked.connect(
+                    lambda _=False, v=value: self.mirrorEnableRequested.emit(v)
+                )
+                self._mirror_rows.addWidget(button)
+            return
+
+        self._mirror_box.setTitle(f"Also switched in {label}")
+        self._mirror_detail.setText(
+            f"Every switch here is repeated in {label}. It keeps its own sign-in, "
+            "so each account is added there once."
+        )
+        if problem or rows is None:
+            note = QLabel(problem or f"Checking {label}…")
+            note.setTextFormat(Qt.TextFormat.PlainText)
+            note.setWordWrap(True)
+            self._mirror_rows.addWidget(note)
+            return
+        for key, name, email, ready in rows:
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            text = QLabel(f"<b>{html.escape(name)}</b> · {html.escape(email)}")
+            text.setTextFormat(Qt.TextFormat.RichText)
+            line.addWidget(text, 1)
+            if ready:
+                line.addWidget(StatusBadge("Ready", "ok"))
+            else:
+                button = QPushButton(f"Add to {label}")
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.setEnabled(not self._busy)
+                button.clicked.connect(
+                    lambda _=False, k=key: self.mirrorAddRequested.emit(k)
+                )
+                line.addWidget(button)
+            self._mirror_rows.addWidget(row)
 
     def _typed_alias(self) -> str:
         return self._alias_input.text().strip().lower()

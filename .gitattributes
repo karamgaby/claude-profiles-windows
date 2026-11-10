@@ -1,0 +1,2 @@
+# Run by bash in WSL or on Linux CI, where a CR breaks every line.
+*.sh text eol=lf

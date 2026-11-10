@@ -47,6 +47,7 @@ MIN_CSWAP_VERSION = (0, 26, 0)
 INSTALL_CSWAP = "uv tool install claude-swap"
 UPGRADE_CSWAP = "uv tool upgrade claude-swap"
 INSTALL_CLAUDE = "curl -fsSL https://claude.ai/install.sh | bash"
+VSCODE_EXTENSIONS = "{home}/.vscode-server/extensions"
 
 LIST_TIMEOUT = 15.0
 DETECT_TIMEOUT = 45.0  # the first call after the VM stopped includes its boot
@@ -213,8 +214,15 @@ class WslEnvironment:
             "~",
             "--exec",
             "/usr/bin/env",
-            f"PATH={search_path(self.home)}",
+            f"PATH={self._path()}",
         ]
+
+    def _path(self) -> str:
+        # VS Code's own claude is on no PATH; add its folder so cswap run finds it.
+        path = search_path(self.home)
+        if self.claude and self.claude.startswith(VSCODE_EXTENSIONS.format(home=self.home)):
+            path += ":" + self.claude.rsplit("/", 1)[0]
+        return path
 
     def cswap_prefix(self) -> list[str]:
         return [*self.exec_prefix(), self.cswap]
@@ -231,6 +239,88 @@ class WslEnvironment:
 
 class WslProblem(Exception):
     """Detection failed in a way the user has to fix. ``message`` says how."""
+
+
+def bundled_linux_cswap() -> tuple[Path, tuple[int, int, int]] | None:
+    """The Linux claude-swap the installer ships for WSL, and its version.
+
+    ``<app folder>\\cswap-linux-X.Y.Z.tar.gz``, frozen from the same pinned
+    claude-swap as the Windows copy. A source checkout has none and uses the
+    claude-swap installed in the distro instead.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    for tarball in Path(sys.executable).resolve().parent.glob("cswap-linux-*.tar.gz"):
+        version = parse_version(tarball.name)
+        if version is not None:
+            return tarball, version
+    return None
+
+
+def _reported_version(runner: Runner, argv: list[str]) -> tuple[int, int, int] | None:
+    try:
+        code, out, err = _run(runner, argv, DETECT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (parse_version(out) or parse_version(err)) if code == 0 else None
+
+
+def _unpack_bundle(
+    runner: Runner,
+    distro: str,
+    base: list[str],
+    home: str,
+    tarball: Path,
+    version: tuple[int, int, int],
+) -> str:
+    """Put the shipped claude-swap into the distro, once per version.
+
+    It goes under ``~/.local/share/claude-profiles`` and reads the same account
+    store as any claude-swap the user installed there. Unpacking again over a
+    half-finished copy is safe, so a copy that does not run is just redone.
+    """
+    folder = f"{home}/.local/share/claude-profiles/cswap-{'.'.join(map(str, version))}"
+    cswap = f"{folder}/cswap/cswap"
+    if _reported_version(runner, [*base, cswap, "--version"]) == version:
+        return cswap
+    try:
+        code, out, _ = _run(runner, [*base, "wslpath", "-u", str(tarball)], DETECT_TIMEOUT)
+        source = out.strip()
+        if code != 0 or not source.startswith("/") or "\n" in source:
+            raise WslProblem(
+                f"{distro} cannot see the Claude Profiles folder, so claude-swap "
+                "could not be set up there. Is the Windows drive mounted in WSL?"
+            )
+        for command in (["mkdir", "-p", folder], ["tar", "-xzf", source, "-C", folder]):
+            code, _, err = _run(runner, [*base, *command], DETECT_TIMEOUT)
+            if code != 0:
+                raise WslProblem(
+                    f"Could not set up claude-swap in {distro}: {err.strip()[:200]}"
+                )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WslProblem(f"Could not set up claude-swap in {distro}.") from exc
+    if _reported_version(runner, [*base, cswap, "--version"]) != version:
+        raise WslProblem(f"The claude-swap set up in {distro} did not start.")
+    return cswap
+
+
+def _vscode_claude(runner: Runner, env_prefix: list[str], home: str) -> str | None:
+    """The claude that VS Code's Remote-WSL extension ships, newest first.
+
+    People who only use Claude Code through VS Code have no other one, and it
+    signs in the same way, so no separate install is needed.
+    """
+    root = VSCODE_EXTENSIONS.format(home=home)
+    argv = [*env_prefix, "find", root, "-maxdepth", "4", "-type", "f",
+            "-path", f"{root}/anthropic.claude-code-*/resources/native-binary/claude"]
+    try:
+        _, out, _ = _run(runner, argv, DETECT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    paths = [p.strip() for p in out.splitlines() if _POSIX_PATH.match(p.strip())]
+    # shortcut: sorts by the first x.y.z in the path; a home folder named like a
+    # version would confuse it. Parse the extension folder name if that ever bites.
+    return max(paths, key=lambda p: parse_version(p) or (0, 0, 0), default=None)
 
 
 def detect(distro: str, runner: Runner = subprocess.run) -> WslEnvironment:
@@ -268,6 +358,18 @@ def detect(distro: str, runner: Runner = subprocess.run) -> WslEnvironment:
         path = line.strip()
         if _POSIX_PATH.match(path):
             found.setdefault(path.rsplit("/", 1)[-1], path)
+
+    if "claude" not in found:
+        claude = _vscode_claude(runner, env_prefix, home)
+        if claude is not None:
+            found["claude"] = claude
+
+    bundle = bundled_linux_cswap()
+    if bundle is not None:
+        cswap = _unpack_bundle(runner, distro, base, home, *bundle)
+        return WslEnvironment(
+            distro=distro, home=home, cswap=cswap, version=bundle[1], claude=found.get("claude")
+        )
 
     cswap = found.get("cswap")
     if cswap is None:

@@ -8,26 +8,33 @@
 # claude-swap itself comes from tools/cswap/requirements.txt, pinned and
 # hash-locked. This is a console program on purpose: the tray app runs it with
 # no window and reads its JSON, and people can also run it in a terminal.
+#
+# The same spec freezes the Linux copy shipped for WSL (tools/cswap/build_linux.sh):
+# there keyring is not a dependency and there is no version resource.
 
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
-from PyInstaller.utils.win32.versioninfo import (
-    FixedFileInfo,
-    StringFileInfo,
-    StringStruct,
-    StringTable,
-    VarFileInfo,
-    VarStruct,
-    VSVersionInfo,
-)
+
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo,
+        StringFileInfo,
+        StringStruct,
+        StringTable,
+        VarFileInfo,
+        VarStruct,
+        VSVersionInfo,
+    )
 
 from importlib.metadata import version as _dist_version
 
 CSWAP_VERSION = _dist_version("claude-swap")
 
 
-def _version_resource() -> VSVersionInfo:
+def _version_resource() -> "VSVersionInfo":
     numbers = tuple(int(part) for part in CSWAP_VERSION.split(".")[:3]) + (0,)
     strings = {
         "CompanyName": "realiti4 (bundled by Claude Profiles)",
@@ -53,7 +60,11 @@ def _version_resource() -> VSVersionInfo:
 # claude-swap reads its own version from package metadata at import time, and
 # keyring discovers its Windows backend through entry points; both need the
 # dist-info copied in or the frozen program fails on start.
-datas = copy_metadata("claude-swap") + copy_metadata("keyring", recursive=True)
+datas = copy_metadata("claude-swap")
+hiddenimports = collect_submodules("claude_swap")
+if WINDOWS:
+    datas += copy_metadata("keyring", recursive=True)
+    hiddenimports += collect_submodules("keyring.backends")
 # Textual ships stylesheets as package data for claude-swap's terminal UI.
 datas += collect_data_files("textual")
 
@@ -62,7 +73,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=collect_submodules("claude_swap") + collect_submodules("keyring.backends"),
+    hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
     # The macOS menu bar extra is never used on Windows.
@@ -84,7 +95,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
-    version=_version_resource(),
+    version=_version_resource() if WINDOWS else None,
 )
 
 coll = COLLECT(

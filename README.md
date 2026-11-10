@@ -235,29 +235,30 @@ There is no Refresh button, because there is nothing to press:
 ## Claude Code in WSL
 
 Claude Code inside a WSL2 distribution, including the VS Code extension in Remote-WSL, keeps its
-login in the distribution's own `~/.claude`, which the Windows claude-swap never sees. To manage
-it instead:
+login in the distribution's own `~/.claude`, which the Windows claude-swap never sees. The app
+only mentions WSL on a machine that has a distribution, and nothing needs installing in it:
 
-1. In the distribution, install claude-swap and Claude Code:
+1. On the **Accounts** page, press **Switch Ubuntu (WSL) too** (named after your distribution).
+   Every switch is then repeated there, matched by email.
+2. The same page lists your accounts with **Ready** or **Add to Ubuntu (WSL)**. Adding one opens
+   Claude Code's sign-in inside the distribution; sign in as that account and the app stores it
+   by itself. Windows and WSL keep separate logins, because sharing one would sign the other
+   side out whenever it renews, so each account is signed in there once.
 
-   ```bash
-   uv tool install claude-swap                      # 0.26.0 or newer
-   curl -fsSL https://claude.ai/install.sh | bash   # Claude Code's native installer
-   ```
+The installer carries a Linux build of the same pinned claude-swap, and the app unpacks it into
+`~/.local/share/claude-profiles` the first time. Signing in uses the Claude Code installed in
+the distribution, or else the one VS Code's Remote-WSL extension ships.
 
-   Both land in `~/.local/bin`, which is where the app looks. (The Claude Code inside VS Code's
-   WSL server is not on any PATH, so launching and signing in need this native install.)
-2. In **Settings**, set **Claude Code runs in** to the distribution. The card underneath says what
-   it found, or what is missing.
-3. Add your accounts on the **Accounts** page as usual; signing in opens a terminal inside the
-   distribution.
-
-One environment is managed at a time: switching the setting replaces the accounts on screen.
+To manage only the WSL Claude Code instead, set **Settings > Claude Code runs in** to the
+distribution. One environment is shown at a time: switching that setting replaces the accounts
+on screen.
 Background checks never start a stopped distribution, so WSL still shuts down when idle; usage
 shows the last known values until you open Claude Profiles, which starts it.
 
 Each call runs as `wsl.exe -d <distro> --exec ...` with an argument list, never through a shell,
-and is limited to the same claude-swap commands as on Windows.
+and is limited to the same claude-swap commands as on Windows. Running from a source checkout,
+which has no Linux build, uses a claude-swap installed in the distribution
+(`uv tool install claude-swap`).
 
 ## When an account needs re-authentication
 

@@ -248,8 +248,8 @@ class MainWindow(QMainWindow):
         page = Page(
             "Privacy",
             "Claude Profiles runs entirely on this computer. Its only outside "
-            "interaction is running the local cswap command - through wsl.exe "
-            "when Claude Code runs in WSL - and reading what it prints.",
+            "interaction is running claude-swap on this computer and reading "
+            "what it prints.",
         )
         page.add_section("What this app keeps")
         page.add(BulletCard("check", "success", PRIVACY_STORED))
@@ -315,24 +315,41 @@ class MainWindow(QMainWindow):
             )
         )
 
+        # Built first: filling the environments refills it.
+        self._mirror_combo = QComboBox()
+        self._mirror_combo.setMinimumWidth(170)
+        self._mirror_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+
         self._environment_combo = QComboBox()
         self._environment_combo.setMinimumWidth(170)
         self._environment_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._fill_environments([], settings.claude_environment)
-        self._environment_combo.currentIndexChanged.connect(self._emit_settings)
+        self._environment_combo.currentIndexChanged.connect(self._on_environment_changed)
+        self._mirror_combo.currentIndexChanged.connect(self._emit_settings)
         self._environment_card = page.add(
             SettingsCard(
                 "terminal",
                 "Claude Code runs in",
                 "Choose a WSL distribution if you use Claude Code inside WSL, "
-                "including VS Code in Remote-WSL. claude-swap must be installed "
-                "there too.",
+                "including VS Code in Remote-WSL. Claude Profiles sets up "
+                "claude-swap there itself.",
                 self._environment_combo,
+            )
+        )
+        self._mirror_card = page.add(
+            SettingsCard(
+                "switch",
+                "Also switch accounts in",
+                "Repeat every switch there, for the same email, so Windows and WSL "
+                "stay on one account. Add each account there on the Accounts page.",
+                self._mirror_combo,
             )
         )
         if self._mock_mode:
             self._environment_card.set_description("Demo mode uses synthetic accounts.")
             self._environment_card.set_available(False)
+            self._mirror_card.set_available(False)
+        self._sync_wsl_cards()
 
         page.add_section("Notifications")
         self._alerts_toggle = ToggleSwitch()
@@ -445,6 +462,7 @@ class MainWindow(QMainWindow):
                 critical_threshold_pct=self._critical_stepper.value(),
                 hotkeys_enabled=self._hotkeys_toggle.isChecked(),
                 claude_environment=self._selected_environment(),
+                mirror_environment=self._selected_mirror(),
             )
         )
 
@@ -471,13 +489,54 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(index if index >= 0 else 0)
         finally:
             self._loading_settings = was_loading
+        self._fill_mirrors(self._selected_mirror())
+
+    def _on_environment_changed(self, *_args) -> None:
+        self._fill_mirrors(self._selected_mirror())
+        self._emit_settings()
+
+    def _selected_mirror(self) -> str:
+        value = self._mirror_combo.currentData()
+        return value if isinstance(value, str) else self._settings.mirror_environment
+
+    def _fill_mirrors(self, selected: str) -> None:
+        """Nowhere, then every environment except the one Claude Code runs in."""
+        primary = self._selected_environment()
+        combo = self._environment_combo
+        values = [""] + [
+            v for v in (combo.itemData(i) for i in range(combo.count())) if v != primary
+        ]
+        if selected and selected != primary and selected not in values:
+            values.append(selected)  # a distro not listed yet, as above
+        was_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            self._mirror_combo.clear()
+            for value in values:
+                label = environment_label(value) if value else "Nowhere"
+                self._mirror_combo.addItem(label, value)
+            index = self._mirror_combo.findData(selected)
+            self._mirror_combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            self._loading_settings = was_loading
 
     def set_environments(self, distros: list[str]) -> None:
         """The installed WSL distributions, once the tray has listed them."""
         self._fill_environments(distros, self._selected_environment())
+        self._sync_wsl_cards()
+
+    def _sync_wsl_cards(self) -> None:
+        """Only a machine with a WSL distribution (or a setting naming one)
+        sees the WSL cards; everyone else is never told about WSL."""
+        has_wsl = self._environment_combo.count() > 1 or bool(self._selected_mirror())
+        self._environment_card.setVisible(has_wsl)
+        self._mirror_card.setVisible(has_wsl)
 
     def set_environment_status(self, text: str, tone: str = "tertiary") -> None:
         self._environment_card.set_status(text, tone)
+
+    def set_mirror_status(self, text: str, tone: str = "tertiary") -> None:
+        self._mirror_card.set_status(text, tone)
 
     def load_settings(self, settings: Settings) -> None:
         """Push values back into the controls without re-emitting."""
@@ -498,6 +557,7 @@ class MainWindow(QMainWindow):
             index = self._environment_combo.findData(settings.claude_environment)
             if index >= 0:
                 self._environment_combo.setCurrentIndex(index)
+            self._fill_mirrors(settings.mirror_environment)
             self._sync_threshold_availability()
         finally:
             self._loading_settings = False

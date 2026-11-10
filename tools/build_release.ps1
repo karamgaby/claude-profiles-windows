@@ -17,7 +17,10 @@
 [CmdletBinding()]
 param(
     [string]$Python = "",
-    [string]$Iscc = ""
+    [string]$Iscc = "",
+    # The Linux claude-swap for WSL (cswap-linux-X.Y.Z.tar.gz). CI builds it on
+    # Linux and passes it in; left empty, it is built here through WSL.
+    [string]$LinuxCswap = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,6 +80,17 @@ Invoke-Checked $Python @("-m", "PyInstaller", "--noconfirm", "--distpath", $AppD
 $Pinned = (Select-String -Path "tools\cswap\requirements.in" -Pattern '^claude-swap==(.+)$').Matches[0].Groups[1].Value
 $Reported = (& (Join-Path $AppDir "cswap\cswap.exe") --version).Trim()
 if ($LASTEXITCODE -ne 0 -or $Reported -ne "cswap $Pinned") { throw "bundled cswap reports '$Reported', expected 'cswap $Pinned'" }
+
+Step "Bundling claude-swap for WSL"
+# Unpacked into a distribution the first time the app manages Claude Code
+# there, so WSL needs nothing installed either.
+if (-not $LinuxCswap) {
+    $LinuxOut = Join-Path $Root "build\linux-cswap"
+    Invoke-Checked "wsl.exe" @("--cd", $Root, "--exec", "bash", "tools/cswap/build_linux.sh", "build/linux-cswap")
+    $LinuxCswap = (Get-ChildItem (Join-Path $LinuxOut "cswap-linux-*.tar.gz") | Select-Object -First 1).FullName
+}
+if ((Split-Path -Leaf $LinuxCswap) -ne "cswap-linux-$Pinned.tar.gz") { throw "Linux claude-swap '$LinuxCswap' is not version $Pinned" }
+Copy-Item $LinuxCswap $AppDir
 
 Step "Writing third-party notices"
 Invoke-Checked $Python @("tools\third_party_notices.py", (Join-Path $AppDir "THIRD-PARTY-NOTICES.txt"))
